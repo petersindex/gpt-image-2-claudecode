@@ -113,4 +113,5 @@ Issues and pull requests are welcome; questions and show-and-tell go in
 
 ## Licence
 
-MIT
+MIT. An independent project, not affiliated with or endorsed by OpenAI or Anthropic.
+gpt-image-2, ChatGPT and Codex are OpenAI's; Claude and Claude Code are Anthropic's.
