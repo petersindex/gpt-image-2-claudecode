@@ -31,6 +31,12 @@ for this page.
 Where the chat renders markdown images you see the image inline; in the terminal you get
 its path.
 
+## Where it works
+
+Anywhere Claude Code runs on your own machine: the terminal, the **Code** tab of the Claude
+desktop app (local sessions), and the VS Code and JetBrains extensions. It does not work in
+claude.ai chat or Cowork, which run in Anthropic's cloud where your Codex login isn't.
+
 ## Requirements
 
 - macOS or Linux.

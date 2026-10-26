@@ -264,7 +264,10 @@ class DoctorTest(GenTest):
         self.assertEqual(r.returncode, 1)
         self.assertIn("codex login", r.stdout)
 
-    def test_no_codex_on_path_fails(self):
+    def test_no_codex_anywhere_fails(self):
+        if SYSTEM_CODEX:
+            self.skipTest(f"a system-wide codex exists: {SYSTEM_CODEX[0]}")
+
         r = self.s.gen("doctor", PATH="/usr/bin:/bin")
 
         self.assertEqual(r.returncode, 1)
@@ -279,6 +282,43 @@ class DoctorTest(GenTest):
 
         self.assertEqual(r.returncode, 1)
         self.assertIn("projects.json", r.stdout)
+
+
+SYSTEM_CODEX = [p for p in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex",
+                            "/Applications/ChatGPT.app/Contents/Resources/codex")
+                if os.path.exists(p)]
+
+
+class BarePathTest(GenTest):
+    """Apps opened from the Dock (Claude Desktop) often get a PATH without ~/.local/bin."""
+
+    BARE = "/usr/bin:/bin"
+
+    def setUp(self):
+        super().setUp()
+        local_bin = self.s.home / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        shutil.move(str(self.s.bin / "codex"), local_bin / "codex")
+        host = local_bin / "codex-code-mode-host"
+        host.write_text("#!/bin/sh\n")
+        host.chmod(0o755)
+        (self.s.home / ".codex").mkdir()
+        self.local_codex = local_bin / "codex"
+
+    def test_codex_in_local_bin_is_found_without_path(self):
+        out = self.s.home / "Pictures" / "gpt-image-2" / "mug.png"
+
+        r = self.s.gen("run", "--out", str(out), "--prompt", "a mug", PATH=self.BARE)
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(out.exists())
+
+    def test_doctor_says_where_it_found_codex(self):
+        r = self.s.gen("doctor", PATH=self.BARE)
+
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn(str(self.local_codex), r.stdout)
+        self.assertIn("not on PATH", r.stdout)
 
 
 def has_pillow(*python_flags):

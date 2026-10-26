@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 (26 October 2026)
+
+- Works in the Claude desktop app even when it can't see your terminal's PATH: the skill now
+  finds Codex (and exiftool) in the usual install folders on its own.
+- `doctor` says where it found Codex.
+
 ## 1.0.0 (26 October 2026)
 
 First public release.

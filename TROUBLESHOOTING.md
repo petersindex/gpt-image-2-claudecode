@@ -9,6 +9,11 @@ without spending a render, and prints the fix for each problem it finds.
   `/Applications/ChatGPT.app/Contents/Resources/` with the macOS desktop app, or
   `~/.codex/packages/standalone/current/bin/` for the standalone install. `doctor` prints
   the exact `ln -sf` command for your machine.
+- **`codex not found`**: gen.py looks on PATH, then in `~/.local/bin`, the standalone
+  install, `/opt/homebrew/bin`, `/usr/local/bin` and `ChatGPT.app`. Apps opened from the
+  Dock, such as Claude Desktop, often run without your shell's PATH, which is why it looks
+  beyond it. If your codex lives somewhere else, add its folder to `PATH` under `env` in
+  `~/.claude/settings.json`.
 - **`not supported when using Codex with a ChatGPT account`**: the account's plan does not
   serve that model. Report it; never pick another model.
 - **`codex finished but produced no image`**: codex declined or misread the request. Its last

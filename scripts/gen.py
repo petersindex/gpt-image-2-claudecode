@@ -56,6 +56,39 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") 
 PROJECTS_FILE = CONFIG_DIR / "projects.json"
 
 
+# Where codex usually lives when it is not on PATH, as in apps opened from the Dock
+# (Claude Desktop). Personal installs first, then system-wide ones.
+CODEX_FALLBACKS = (
+    Path.home() / ".local" / "bin" / "codex",
+    Path.home() / ".codex" / "packages" / "standalone" / "current" / "bin" / "codex",
+    Path("/opt/homebrew/bin/codex"),
+    Path("/usr/local/bin/codex"),
+    Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+)
+
+
+def find_codex():
+    """Absolute path of the codex to run, or None."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    for p in CODEX_FALLBACKS:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def find_exiftool():
+    return shutil.which("exiftool") or next(
+        (str(p) for p in (Path("/opt/homebrew/bin/exiftool"), Path("/usr/local/bin/exiftool"))
+         if p.is_file()), None)
+
+
+def codex_env(codex):
+    """Put codex's own folder on PATH, so an npm install still finds its node."""
+    return {**os.environ, "PATH": os.pathsep.join([str(Path(codex).parent), os.environ.get("PATH", "")])}
+
+
 def fail(msg, code=1):
     print(f"gen.py: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -184,13 +217,17 @@ def run_codex(text, edits, timeout):
     """Run one codex exec. Returns (thread_id, last agent message, error lines)."""
     # read-only: image_gen saves through codex itself, so the agent never needs to write.
     # Edit sources are attached with -i so the model sees them, not just their paths.
-    cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only"]
+    codex = find_codex()
+    if not codex:
+        return None, None, ["codex not found. Run: gen.py doctor"]
+    cmd = [codex, "exec", "--json", "--skip-git-repo-check", "-s", "read-only"]
     for e in edits:
         cmd += ["-i", e]
     cmd += ["--", text]
     # Own process group, so a timeout also kills the helpers codex spawns.
-    proc = subprocess.Popen(cmd, cwd=SCRATCH, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    proc = subprocess.Popen(cmd, cwd=SCRATCH, env=codex_env(codex), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -233,10 +270,11 @@ def image_info(path):
 
 
 def provenance(path):
-    if not shutil.which("exiftool"):
+    exiftool = find_exiftool()
+    if not exiftool:
         return {}
     try:
-        out = subprocess.run(["exiftool", "-j", "-a", "-G1", str(path)],
+        out = subprocess.run([exiftool, "-j", "-a", "-G1", str(path)],
                              capture_output=True, text=True, timeout=30).stdout
         meta = json.loads(out)[0]
     except Exception:
@@ -246,8 +284,11 @@ def provenance(path):
 
 
 def codex_version():
+    codex = find_codex()
+    if not codex:
+        return None
     try:
-        return subprocess.run(["codex", "--version"], capture_output=True,
+        return subprocess.run([codex, "--version"], capture_output=True, env=codex_env(codex),
                               text=True, timeout=30).stdout.strip()
     except Exception:
         return None
@@ -396,14 +437,17 @@ def cmd_doctor(args):
         failures += level == "FAIL"
         print(f"{level:<4}  {msg}")
 
-    codex = shutil.which("codex")
+    codex = find_codex()
     if not codex:
-        report("FAIL", "codex is not on PATH. Install the Codex CLI: https://github.com/openai/codex")
+        report("FAIL", "codex not found on PATH or in the usual install folders. Install the "
+                       "Codex CLI: https://github.com/openai/codex")
     else:
         report("ok", f"{codex_version() or 'codex'} at {codex}")
+        if not shutil.which("codex"):
+            report("ok", f"codex is not on PATH here, so gen.py runs it from {codex} directly")
         try:
-            login = subprocess.run(["codex", "login", "status"], capture_output=True,
-                                   text=True, timeout=30)
+            login = subprocess.run([codex, "login", "status"], capture_output=True,
+                                   env=codex_env(codex), text=True, timeout=30)
             logged_in = login.returncode == 0
         except Exception:
             logged_in = False
@@ -446,7 +490,7 @@ def cmd_doctor(args):
     else:
         report("warn", f"Pillow not installed for {sys.executable}: variants come without a "
                        f"contact sheet. Fix: {sys.executable} -m pip install pillow")
-    if shutil.which("exiftool"):
+    if find_exiftool():
         report("ok", "exiftool installed (C2PA provenance in the log)")
     else:
         report("warn", "exiftool not installed: the log has no C2PA provenance")
