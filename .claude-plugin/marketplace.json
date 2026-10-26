@@ -1,0 +1,14 @@
+{
+  "name": "petersindex",
+  "description": "Claude Code plugins by petersindex.",
+  "owner": { "name": "petersindex", "url": "https://github.com/petersindex" },
+  "plugins": [
+    {
+      "name": "gpt-image-2",
+      "source": "./",
+      "description": "Generate and edit images with gpt-image-2 through the Codex CLI on your ChatGPT plan.",
+      "category": "media",
+      "tags": ["image-generation", "codex"]
+    }
+  ]
+}

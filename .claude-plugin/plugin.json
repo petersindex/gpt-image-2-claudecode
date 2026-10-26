@@ -1,0 +1,10 @@
+{
+  "name": "gpt-image-2",
+  "displayName": "gpt-image-2",
+  "description": "Generate and edit images with OpenAI's gpt-image-2 from Claude Code, through the Codex CLI on your ChatGPT plan. No API key.",
+  "author": { "name": "petersindex", "url": "https://github.com/petersindex" },
+  "homepage": "https://github.com/petersindex/gpt-image-2-claudecode",
+  "repository": "https://github.com/petersindex/gpt-image-2-claudecode",
+  "license": "MIT",
+  "keywords": ["image-generation", "gpt-image-2", "codex", "chatgpt"]
+}

@@ -3,50 +3,79 @@
 **Claude can't make images. Codex can, on the ChatGPT plan you already pay for.**
 
 A Claude Code skill that lets Claude generate and edit images with OpenAI's gpt-image-2 by
-driving the Codex CLI. Ask for a photo, a mockup, a texture or an edit to an existing file,
-and Claude writes the prompt, runs the render, checks the PNG and shows it to you.
+driving the Codex CLI. Ask for a photo, a mockup, a texture or an edit to an existing file.
+Claude writes the prompt, runs the render, looks at the result and tells you where it
+landed.
 
 No `OPENAI_API_KEY`. Renders count against your ChatGPT subscription's Codex usage.
 
-```
-> make me a hero shot of a matte black ceramic mug on a concrete bench, morning light, 3:2
+| `make me a hero shot of a matte black mug on a concrete bench, morning light, 3:2` | `now make it a glossy forest-green glaze, keep everything else` |
+| --- | --- |
+| ![A matte black mug on a concrete bench in morning light](docs/matte-black-mug.jpg) | ![The same mug, now glossy green, everything else unchanged](docs/mug-green-glaze.jpg) |
 
-![matte black mug](/tmp/gpt-image-2/matte-black-mug.png)
-```
+Both images came out of this skill in about 40 seconds each, unretouched apart from resizing
+for this page.
 
 ## What it does
 
 - **Generate** from a written brief.
 - **Edit** an existing image, or combine several reference images.
-- **Variants**: up to 6 renders in parallel, plus a labelled contact sheet.
-- **Finds the exact file** each run produced (by Codex thread id, never by "newest file").
+- **Variants**: up to 6 renders of one brief, plus a labelled contact sheet.
+- **Queues safely**: only 3 renders run at once across every session, so parallel requests
+  wait their turn instead of timing out.
 - **Logs every render** to `gpt-image-log.jsonl` next to the image: prompt, sources, size,
-  thread id and C2PA provenance, so you can remake or trace any asset.
+  Codex thread id and C2PA provenance, so you can remake or trace any asset.
 - **Per-project output folders**: renders land in your project's image folder when you're
-  working inside it, and `/tmp/gpt-image-2/` otherwise.
+  working inside it, and `~/Pictures/gpt-image-2/` otherwise.
+
+Where the chat renders markdown images you see the image inline; in the terminal you get
+its path.
 
 ## Requirements
 
+- macOS or Linux.
 - [Codex CLI](https://github.com/openai/codex), signed in with a ChatGPT account
   (`codex login`).
 - Python 3.9+.
-- Optional: [Pillow](https://pypi.org/project/pillow/) for image validation and variant
-  contact sheets, and `exiftool` for C2PA provenance in the log. The skill runs Python with
-  `-I`, which skips user site-packages, so install Pillow where the system `python3` can see
-  it.
+- Optional: [Pillow](https://pypi.org/project/pillow/) for variant contact sheets and image
+  checks, and `exiftool` for C2PA provenance in the log. Everything else works without
+  them.
 
 ## Install
+
+As a plugin, so you get fixes with `/plugin update`:
+
+```
+/plugin install gpt-image-2 --marketplace petersindex/gpt-image-2-claudecode
+```
+
+On Claude Code before 2.1.275, add the marketplace first:
+
+```
+/plugin marketplace add petersindex/gpt-image-2-claudecode
+/plugin install gpt-image-2@petersindex
+```
+
+Or as a plain skill:
 
 ```bash
 git clone https://github.com/petersindex/gpt-image-2-claudecode ~/.claude/skills/gpt-image-2
 ```
 
-Start a new Claude Code session. Ask for an image, or type `/gpt-image-2`.
+Then check your setup. This renders nothing and prints the fix for anything missing:
+
+```bash
+python3 ~/.claude/skills/gpt-image-2/scripts/gen.py doctor
+```
+
+(For the plugin install, Claude can run it for you: ask it to "run the gpt-image-2 doctor".)
+
+Start a new Claude Code session and ask for an image.
 
 ### Optional: project output folders
 
-Copy `projects.example.json` to `projects.json` in the same folder and map each project
-root to the folder its images belong in:
+Create `~/.config/gpt-image-2/projects.json` and map each project root to the folder its
+images belong in:
 
 ```json
 {
@@ -56,17 +85,33 @@ root to the folder its images belong in:
 
 A folder named `generated/` gets its own `.gitignore`, so raw renders never get committed.
 
+### Optional: your own rules
+
+Anything in `~/.config/gpt-image-2/LOCAL.md` is read every time the skill runs and wins over
+the defaults: house style, naming, where finished assets go. It lives outside the skill, so
+updates never overwrite it.
+
 ## Good to know
 
 - **It depends on Codex internals.** Where Codex saves images and how `image_gen` is wired
   are not documented APIs. A Codex update can break this. If it does, open an issue.
 - **gpt-image-2 only.** Codex's built-in tool has no model choice, and the skill refuses to
   fall back to older image models.
-- **About 3 renders at once.** More than that queue up in Codex and tend to time out.
 - **Transparent backgrounds** are done with a chroma key and Codex's own
   `remove_chroma_key.py`, not a model switch.
+- **How it finds the image**: `codex exec --json` reports a thread id, and Codex saves that
+  run's render under `$CODEX_HOME/generated_images/<thread_id>/`. The script reads it from
+  there, so it never guesses by "newest file". Codex runs in a read-only sandbox.
 
-Troubleshooting for every known error is in [SKILL.md](SKILL.md#when-it-fails).
+Errors and settings: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The tests drive `gen.py` against a fake `codex`, so they spend no renders.
 
 ## Licence
 

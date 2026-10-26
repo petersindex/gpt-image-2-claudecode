@@ -3,11 +3,17 @@
 
   gen.py dest <slug> [--variants N]
       Print the next free destination path for <slug>. Inside a project listed in
-      projects.json it is that project's image folder, otherwise /tmp/gpt-image-2/.
+      ~/.config/gpt-image-2/projects.json it is that project's image folder, otherwise
+      $GPT_IMAGE_DIR, default ~/Pictures/gpt-image-2/.
 
   gen.py run --out PATH --prompt TEXT [--edit SRC ...] [--variants N] [--force]
       Render, verify, copy to PATH, append to gpt-image-log.jsonl beside it.
-      With --variants N, writes <stem>-v1..vN.png and a contact sheet at PATH.
+      With --variants N, writes <stem>-v1..vN.png and, with Pillow, a contact sheet at
+      PATH. At most GEN_CONCURRENCY renders (default 3) run at once across every gen.py
+      process; GEN_TIMEOUT (default 540 s) is the budget for the whole run.
+
+  gen.py doctor
+      Check codex, its login, its helper binary and the optional extras. Renders nothing.
 
 Exit 0 on success, 1 on failure, 2 when only some variants succeeded. Final paths go to
 stdout, one per line. Diagnostics go to stderr.
@@ -15,23 +21,39 @@ stdout, one per line. Diagnostics go to stderr.
 
 import argparse
 import datetime
+import fcntl
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-WORKDIR = Path("/tmp/gpt-image-2")
-GENERATED_IMAGES = Path.home() / ".codex" / "generated_images"
-CODEX_TIMEOUT = int(os.environ.get("GEN_TIMEOUT", 540))  # under the Bash tool's 600 s ceiling; raise GEN_TIMEOUT for background queues
+# Where images land outside a listed project. /tmp would be wiped on reboot.
+DEFAULT_OUT = Path(os.environ.get("GPT_IMAGE_DIR") or Path.home() / "Pictures" / "gpt-image-2").expanduser()
+# codex's working directory, also holds the lock files. Per-user on macOS.
+SCRATCH = Path(tempfile.gettempdir()) / "gpt-image-2"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+GENERATED_IMAGES = CODEX_HOME / "generated_images"
+# Wall-clock budget for one gen.py run, waiting for a slot included. 540 s fits under the
+# Bash tool's 600 s ceiling; raise it for background runs.
+BUDGET = int(os.environ.get("GEN_TIMEOUT", 540))
+# Renders a subscription runs at once. Extra ones queue inside codex and time out, so
+# every gen.py process on the machine shares this many slots.
+CONCURRENCY = max(1, int(os.environ.get("GEN_CONCURRENCY", 3)))
 LOG_NAME = "gpt-image-log.jsonl"
 MAX_VARIANTS = 6
 
-# Optional map of project roots to the folder generated images belong in, kept beside
-# SKILL.md. See projects.example.json.
-PROJECTS_FILE = Path(__file__).resolve().parent.parent / "projects.json"
+# Optional map of project roots to the folder generated images belong in, e.g.
+# {"~/code/my-app": "brand/generated"}. It lives outside the skill folder so a plugin
+# update or a fresh clone never wipes it.
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gpt-image-2"
+PROJECTS_FILE = CONFIG_DIR / "projects.json"
 
 
 def fail(msg, code=1):
@@ -46,30 +68,53 @@ def load_projects():
         raw = json.loads(PROJECTS_FILE.read_text())
     except json.JSONDecodeError as e:
         fail(f"{PROJECTS_FILE} is not valid JSON: {e}")
+    if not isinstance(raw, dict):
+        fail(f"{PROJECTS_FILE} must be an object of project root to image folder")
     return {os.path.realpath(os.path.expanduser(root)): sub for root, sub in raw.items()}
 
 
 def dest_dir(cwd):
     cwd = os.path.realpath(cwd)
-    for root, sub in load_projects().items():
+    # Longest root first, so a project nested inside another listed root wins.
+    for root, sub in sorted(load_projects().items(), key=lambda kv: -len(kv[0])):
         if cwd == root or cwd.startswith(root + os.sep):
-            return Path(root) / sub
-    return WORKDIR
+            return Path(root) / os.path.expanduser(sub)
+    return Path(os.path.realpath(DEFAULT_OUT))
+
+
+def canon(path):
+    """One spelling per file, so checks and locks agree on what "the same path" is."""
+    return Path(os.path.realpath(os.path.expanduser(path)))
 
 
 def variant_path(out, i):
     return out.with_name(f"{out.stem}-v{i}{out.suffix}")
 
 
+def slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "image"
+
+
+def has_pillow():
+    try:
+        import PIL  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def cmd_dest(args):
     d = dest_dir(os.getcwd())
+    slug = slugify(args.slug)
     n = 1
     while True:
-        name = args.slug if n == 1 else f"{args.slug}-{n}"
+        name = slug if n == 1 else f"{slug}-{n}"
         p = d / f"{name}.png"
-        taken = [p] + [variant_path(p, i) for i in range(1, args.variants + 1)]
-        if not any(t.exists() for t in taken):
-            print(p)
+        variants = [variant_path(p, i) for i in range(1, args.variants + 1)]
+        if not any(t.exists() or in_flight(t) for t in [p] + variants):
+            # Without Pillow there is no contact sheet, so offer each variant instead.
+            for line in variants if args.variants > 1 and not has_pillow() else [p]:
+                print(line)
             return
         n += 1
 
@@ -89,25 +134,72 @@ def build_prompt(prompt, edits):
     if not edits:
         return f"Use the image_gen tool to generate: {prompt}.{tail}"
     if len(edits) == 1:
-        return f"Use the image_gen tool to edit {edits[0]}: {prompt}.{tail}"
+        return f"Use the image_gen tool to edit the attached image ({edits[0]}): {prompt}.{tail}"
     refs = ", ".join(edits)
-    return f"Use the image_gen tool with these reference images: {refs}. {prompt}.{tail}"
+    return (f"Use the image_gen tool with the attached reference images ({refs}): "
+            f"{prompt}.{tail}")
 
 
-def run_codex(text):
-    """Run one codex exec. Returns (thread_id, last agent message, error lines)."""
-    WORKDIR.mkdir(parents=True, exist_ok=True)
-    cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", text]
+def acquire_slot(deadline):
+    """Lock one of CONCURRENCY slot files, shared by every gen.py process. Returns the
+    open file (closing it frees the slot), or None if none came free before deadline.
+    The OS drops the lock if the process dies, so a crash never leaks a slot."""
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    while True:
+        for i in range(CONCURRENCY):
+            f = open(SCRATCH / f"slot-{i}.lock", "w")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return f
+            except BlockingIOError:
+                f.close()
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def claim(path):
+    """Lock path for this process's lifetime so no other gen.py renders to it meanwhile.
+    Returns the lock (keep it referenced), or None if another run holds it."""
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha1(str(path).encode()).hexdigest()[:16]
+    f = open(SCRATCH / f"claim-{key}.lock", "w")
     try:
-        proc = subprocess.run(
-            cmd, cwd=WORKDIR, stdin=subprocess.DEVNULL, capture_output=True,
-            text=True, timeout=CODEX_TIMEOUT,
-        )
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def in_flight(path):
+    lock = claim(path)
+    if lock is None:
+        return True
+    lock.close()
+    return False
+
+
+def run_codex(text, edits, timeout):
+    """Run one codex exec. Returns (thread_id, last agent message, error lines)."""
+    # read-only: image_gen saves through codex itself, so the agent never needs to write.
+    # Edit sources are attached with -i so the model sees them, not just their paths.
+    cmd = ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only"]
+    for e in edits:
+        cmd += ["-i", e]
+    cmd += ["--", text]
+    # Own process group, so a timeout also kills the helpers codex spawns.
+    proc = subprocess.Popen(cmd, cwd=SCRATCH, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, None, [f"codex exec timed out after {CODEX_TIMEOUT}s"]
+        os.killpg(proc.pid, 9)
+        proc.communicate()
+        return None, None, [f"codex exec timed out after {BUDGET}s (GEN_TIMEOUT)"]
 
     thread_id, last_msg, errors = None, None, []
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
@@ -121,7 +213,7 @@ def run_codex(text):
             last_msg = ev["item"].get("text")
     if proc.returncode != 0:
         errors.append(f"codex exited {proc.returncode}")
-        errors += proc.stderr.strip().splitlines()[-5:]
+        errors += stderr.strip().splitlines()[-5:]
     return thread_id, last_msg, errors
 
 
@@ -161,11 +253,18 @@ def codex_version():
         return None
 
 
-def render_one(out, prompt, edits, force):
+def render_one(out, prompt, edits, deadline):
     """Render one image to out. Returns (ok, log record or error text)."""
-    if out.exists() and not force:
-        return False, f"{out} already exists (pass --force to overwrite)"
-    thread_id, last_msg, errors = run_codex(build_prompt(prompt, edits))
+    slot = acquire_slot(deadline)
+    remaining = deadline - time.monotonic()
+    if slot is None or remaining <= 0:
+        if slot:
+            slot.close()
+        return False, (f"no free codex slot within {BUDGET}s (GEN_TIMEOUT): other renders "
+                       f"held all {CONCURRENCY}. Run it again, or in the background with a "
+                       "higher GEN_TIMEOUT")
+    with slot:
+        thread_id, last_msg, errors = run_codex(build_prompt(prompt, edits), edits, remaining)
     if not thread_id:
         return False, "no thread id from codex. " + " | ".join(errors)
 
@@ -237,29 +336,37 @@ def append_log(out_dir, records):
 
 
 def cmd_run(args):
-    out = Path(args.out).expanduser().resolve()
+    deadline = time.monotonic() + BUDGET
+    out = canon(args.out)
     if out.suffix.lower() != ".png":
         fail("--out must end in .png")
-    edits = [str(Path(e).expanduser().resolve()) for e in args.edit or []]
+    edits = [str(canon(e)) for e in args.edit or []]
     for e in edits:
         if not Path(e).is_file():
             fail(f"edit source not found: {e}")
+    if args.variants > MAX_VARIANTS:
+        fail(f"--variants is capped at {MAX_VARIANTS}")
 
-    if args.variants <= 1:
-        ok, result = render_one(out, args.prompt, edits, args.force)
+    targets = [out] if args.variants <= 1 else [variant_path(out, i) for i in range(1, args.variants + 1)]
+    claims = []
+    for t in dict.fromkeys(targets + [out]):
+        lock = claim(t)
+        if lock is None:
+            fail(f"{t} is already being rendered by another gen.py run. Pick another name")
+        claims.append(lock)
+        if t.exists() and not args.force:
+            fail(f"{t} already exists (pass --force to overwrite)")
+
+    if len(targets) == 1:
+        ok, result = render_one(out, args.prompt, edits, deadline)
         if not ok:
             fail(result)
         append_log(out.parent, [result])
         print(out)
         return
 
-    if args.variants > MAX_VARIANTS:
-        fail(f"--variants is capped at {MAX_VARIANTS}")
-    if out.exists() and not args.force:
-        fail(f"{out} already exists (pass --force to overwrite)")
-    targets = [variant_path(out, i) for i in range(1, args.variants + 1)]
     with ThreadPoolExecutor(len(targets)) as pool:
-        results = list(pool.map(lambda t: render_one(t, args.prompt, edits, args.force), targets))
+        results = list(pool.map(lambda t: render_one(t, args.prompt, edits, deadline), targets))
 
     done = [t for t, (ok, _) in zip(targets, results) if ok]
     for t, (ok, r) in zip(targets, results):
@@ -268,12 +375,87 @@ def cmd_run(args):
     if not done:
         fail("every variant failed")
     append_log(out.parent, [r for ok, r in results if ok])
-    contact_sheet(done, out)
-    print(out)
+    if has_pillow():
+        contact_sheet(done, out)
+        print(out)
+    else:
+        print("gen.py: Pillow is not installed, so no contact sheet. Show each variant.",
+              file=sys.stderr)
     for t in done:
         print(t)
     if len(done) < len(targets):
         sys.exit(2)
+
+
+def cmd_doctor(args):
+    """Check the setup without spending a render. Exit 1 if anything would stop one."""
+    failures = 0
+
+    def report(level, msg):
+        nonlocal failures
+        failures += level == "FAIL"
+        print(f"{level:<4}  {msg}")
+
+    codex = shutil.which("codex")
+    if not codex:
+        report("FAIL", "codex is not on PATH. Install the Codex CLI: https://github.com/openai/codex")
+    else:
+        report("ok", f"{codex_version() or 'codex'} at {codex}")
+        try:
+            login = subprocess.run(["codex", "login", "status"], capture_output=True,
+                                   text=True, timeout=30)
+            logged_in = login.returncode == 0
+        except Exception:
+            logged_in = False
+        if logged_in:
+            report("ok", (login.stdout + login.stderr).strip() or "logged in")
+        else:
+            report("FAIL", "codex is not logged in. Run: codex login (sign in with ChatGPT)")
+
+        # image_gen needs this helper beside the codex on PATH, even when that is a symlink.
+        here = Path(codex).parent / "codex-code-mode-host"
+        if here.exists():
+            report("ok", f"codex-code-mode-host beside codex ({here.parent})")
+        else:
+            real = Path(os.path.realpath(codex)).parent / "codex-code-mode-host"
+            source = real if real.exists() else Path("<dir holding codex-code-mode-host>")
+            report("FAIL", "codex-code-mode-host is not beside codex, so image_gen cannot start. "
+                           f"Fix: ln -sf '{source}' '{here}'")
+
+    if GENERATED_IMAGES.parent.is_dir():
+        report("ok", f"codex home {CODEX_HOME}")
+    else:
+        report("FAIL", f"codex home {CODEX_HOME} does not exist. Run codex once, or fix CODEX_HOME")
+
+    if PROJECTS_FILE.exists():
+        try:
+            projects = json.loads(PROJECTS_FILE.read_text())
+            if not isinstance(projects, dict):
+                raise ValueError("expected an object of project root to image folder")
+            report("ok", f"{PROJECTS_FILE} maps {len(projects)} project(s)")
+            for root in projects:
+                if not Path(os.path.expanduser(root)).is_dir():
+                    report("warn", f"projects.json lists {root}, which does not exist")
+        except ValueError as e:
+            report("FAIL", f"{PROJECTS_FILE} is not valid: {e}")
+    else:
+        report("ok", f"no projects.json, images go to {DEFAULT_OUT}")
+
+    if has_pillow():
+        report("ok", "Pillow installed (contact sheets, image checks)")
+    else:
+        report("warn", f"Pillow not installed for {sys.executable}: variants come without a "
+                       f"contact sheet. Fix: {sys.executable} -m pip install pillow")
+    if shutil.which("exiftool"):
+        report("ok", "exiftool installed (C2PA provenance in the log)")
+    else:
+        report("warn", "exiftool not installed: the log has no C2PA provenance")
+    chroma = CODEX_HOME / "skills" / ".system" / "imagegen" / "scripts" / "remove_chroma_key.py"
+    if not chroma.exists():
+        report("warn", f"{chroma} missing: transparent backgrounds are unavailable")
+
+    print("All set." if not failures else f"{failures} problem(s) will stop a render.")
+    sys.exit(1 if failures else 0)
 
 
 def main():
@@ -292,6 +474,8 @@ def main():
     r.add_argument("--variants", type=int, default=1)
     r.add_argument("--force", action="store_true")
     r.set_defaults(func=cmd_run)
+
+    sub.add_parser("doctor", help="check the setup without rendering").set_defaults(func=cmd_doctor)
 
     args = ap.parse_args()
     args.func(args)
