@@ -105,13 +105,11 @@ updates never overwrite it.
 
 Errors and settings: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-## Development
+## Contributing
 
-```bash
-python3 -m unittest discover -s tests
-```
-
-The tests drive `gen.py` against a fake `codex`, so they spend no renders.
+Issues and pull requests are welcome; questions and show-and-tell go in
+[Discussions](https://github.com/petersindex/gpt-image-2-claudecode/discussions). See
+[CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Licence
 
