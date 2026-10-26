@@ -271,7 +271,7 @@ class DoctorTest(GenTest):
         r = self.s.gen("doctor", PATH="/usr/bin:/bin")
 
         self.assertEqual(r.returncode, 1)
-        self.assertIn("codex is not on PATH", r.stdout)
+        self.assertIn("codex not found", r.stdout)
 
     def test_a_broken_projects_file_fails(self):
         config = self.s.home / ".config" / "gpt-image-2"
